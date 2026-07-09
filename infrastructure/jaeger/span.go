@@ -85,6 +85,12 @@ func (s *span) Debug(scope, message string) {
 	s.addEvent(domain.LevelDebug, scope, message)
 }
 
+// Context mengembalikan ctx yang membawa span ini sebagai span aktif — teruskan
+// ini ke layer berikutnya supaya nesting span benar (child, bukan root baru).
+func (s *span) Context() context.Context {
+	return s.ctx
+}
+
 func (s *span) Finish() {
 	if s.finished {
 		return

@@ -3,8 +3,10 @@
 Modul tracing Jaeger untuk Go dengan **clean architecture**, mudah dibaca dan dipakai di berbagai layanan.
 
 - **Process/span**: `server_ip` dan `exectime` (durasi span) ada di process/span Jaeger; `trace_id` dan `transaction_id` otomatis di tag.
-- **API**: `GetTracing().Operation(ctx, ...)` atau `GetTracingForService("service-name").Operation(ctx, ...)` → `span.Tag()`, `span.Info/Error/Warning/Debug`, `defer span.Finish()`.
+- **API**: `GetTracing().Operation(ctx, ...)` atau `GetTracingForService("service-name").Operation(ctx, ...)` → `span.Tag()`, `span.Info/Error/Warning/Debug`, `span.Context()`, `defer span.Finish()`.
+- **Child span**: teruskan `span.Context()` (bukan `ctx` lama) ke layer berikutnya supaya span bersarang, bukan root baru.
 - **Multi-service (satu process)**: `ServiceNames` di config + `GetTracingForService(serviceName)` agar satu aplikasi muncul sebagai beberapa service di Jaeger (cocok untuk config dari DB/env).
+- **Propagation lintas service**: `tracing.Inject` / `tracing.Extract` (generik) + adapter opsional `transport/http` dan `transport/grpc`.
 
 ## Field di Jaeger
 
@@ -25,14 +27,17 @@ Modul tracing Jaeger untuk Go dengan **clean architecture**, mudah dibaca dan di
 ## Arsitektur (Clean Architecture)
 
 ```
-tracing/              → API publik (Init, GetTracing, GetTracingForService, NewInteractionName, Shutdown)
-domain/               → Entity & interface (LevelId, Span, Tracer, InteractionName/Type)
-config/               → Konfigurasi tracer
-infrastructure/jaeger/ → Implementasi Jaeger (OTLP)
+tracing/                    → API publik (Init, GetTracing, GetTracingForService, Inject/Extract, Shutdown)
+domain/                     → Entity & interface (LevelId, Span, Tracer, InteractionName/Type)
+config/                     → Konfigurasi tracer
+infrastructure/jaeger/      → Implementasi Jaeger (OTLP)
+transport/http/             → Adapter tipis HTTP (middleware + inject header keluar)
+transport/grpc/             → Adapter tipis gRPC (unary client/server interceptor)
 ```
 
 - **Domain**: bebas dependency luar; hanya tipe dan interface.
 - **Infrastructure**: implementasi konkret dengan OpenTelemetry + OTLP (Jaeger).
+- **Transport**: opsional; membungkus `tracing.Inject`/`Extract` untuk HTTP/gRPC tanpa menambah `otelhttp`/`otelgrpc`.
 
 ## Instalasi
 
@@ -105,7 +110,7 @@ tracing.Init(cfg)
 
 ## Penggunaan di tiap function
 
-Pola yang disarankan:
+### Span tunggal
 
 ```go
 func InquiryAccount(ctx context.Context) {
@@ -114,15 +119,39 @@ func InquiryAccount(ctx context.Context) {
         tracing.NewInteractionTypeName("controllers"))
     defer span.Finish()
 
-    span.Tag("user_id", "123")           // tag kustom (muncul di Jaeger)
-    span.Tag("request_id", "abc-xyz")
-
+    span.Tag("user_id", "123")
     span.Info("Request", "message")
-    span.Debug("Payload", "detail payload")
     span.Warning("Fallback", "using default")
     span.Error("DB", "connection failed")
 }
 ```
+
+### Child span (span bersarang)
+
+**Penting:** setelah membuat span, teruskan `span.Context()` ke fungsi/layer berikutnya — **bukan** `ctx` yang dipakai saat `Operation()`.
+
+```go
+func Handler(ctx context.Context) {
+    span := tracing.GetTracing().Operation(ctx,
+        tracing.NewInteractionName("Handler Process"),
+        tracing.NewInteractionTypeName("handlers"))
+    defer span.Finish()
+
+    span.Info("Request", "start")
+    ServiceLayer(span.Context()) // <- child span, bukan root baru
+}
+
+func ServiceLayer(ctx context.Context) {
+    span := tracing.GetTracing().Operation(ctx,
+        tracing.NewInteractionName("Service DoWork"),
+        tracing.NewInteractionTypeName("services"))
+    defer span.Finish()
+
+    span.Info("Work", "done")
+}
+```
+
+Di Jaeger UI, `Service DoWork` muncul sebagai **child** di bawah `Handler Process` dalam satu trace.
 
 Atau jika di project Anda ada package `libs` yang wrap tracing:
 
@@ -148,9 +177,70 @@ syslog := libs.GetTracing().Operation(ctx,
 defer syslog.Finish()
 syslog.Tag("field", "value")
 syslog.Info("Request", "message")
+ServiceLayer(syslog.Context()) // child span
 ```
 
 Contoh lengkap: lihat [examples/usage/main.go](examples/usage/main.go).
+
+## Propagation lintas service
+
+Fungsi generik di `tracing` (tidak terikat transport tertentu):
+
+| Fungsi | Sisi | Kegunaan |
+|--------|------|----------|
+| `tracing.Inject(ctx)` | Pengirim | Ambil trace context → `map[string]string` (header W3C `traceparent`, dll.) |
+| `tracing.Extract(ctx, carrier)` | Penerima | Baca carrier → `context.Context` baru; pakai untuk `Operation()` pertama |
+
+**Pengirim (generik):**
+
+```go
+headers := tracing.Inject(span.Context())
+// taruh headers ke HTTP header, gRPC metadata, Kafka header, dll.
+```
+
+**Penerima (generik):**
+
+```go
+ctx = tracing.Extract(ctx, receivedHeaders)
+span := tracing.GetTracing().Operation(ctx, ...) // otomatis child dari trace pemanggil
+defer span.Finish()
+```
+
+### HTTP (`transport/http`)
+
+```go
+import (
+    nethttp "net/http"
+    httptransport "github.com/funxdofficial/golang-module-jaeger/transport/http"
+)
+
+// Server: extract trace dari request masuk
+mux := nethttp.NewServeMux()
+mux.HandleFunc("/api/foo", handler)
+nethttp.ListenAndServe(":8080", httptransport.Middleware(mux))
+
+// Client: inject trace ke request keluar
+req, _ := nethttp.NewRequestWithContext(span.Context(), "POST", url, body)
+httptransport.InjectHeaders(span.Context(), req.Header)
+client.Do(req)
+```
+
+### gRPC (`transport/grpc`)
+
+```go
+import (
+    "google.golang.org/grpc"
+    grpctransport "github.com/funxdofficial/golang-module-jaeger/transport/grpc"
+)
+
+// Server
+srv := grpc.NewServer(grpc.UnaryInterceptor(grpctransport.UnaryServerInterceptor()))
+
+// Client
+conn, _ := grpc.Dial(addr, grpc.WithUnaryInterceptor(grpctransport.UnaryClientInterceptor()))
+```
+
+Interceptor gRPC hanya untuk **unary** call. Streaming perlu handler serupa jika dibutuhkan.
 
 ## Config
 
@@ -219,7 +309,7 @@ Jika ada error TLS/certificate, jalankan di lingkungan Anda (bukan sandbox) atau
 
 ## Perubahan (Changelog)
 
-Ringkasan perubahan sebelum PR:
+Ringkasan perubahan modul:
 
 ### Fitur baru
 
@@ -227,12 +317,17 @@ Ringkasan perubahan sebelum PR:
 - **Sampling trace** — field `SampleRatio` di config (`ParentBased(TraceIDRatioBased)`) untuk mengurangi overhead server. Default `0.1` via `config.Default()`.
 - **Status span Error** — `span.Error()` memanggil `SetStatus(codes.Error)` sehingga span muncul sebagai error di Jaeger UI, plus tag `error.scope` dan `error.message`.
 - **Tag span Warning** — `span.Warning()` menambah tag `span.status=Warning`, `warning.scope`, dan `warning.message` (OpenTelemetry tidak punya status Warning native).
+- **`span.Context()`** — mengembalikan context yang membawa span aktif; wajib diteruskan ke layer berikutnya agar child span bersarang dengan benar.
+- **Propagation generik** — `tracing.Inject(ctx)` dan `tracing.Extract(ctx, carrier)` untuk membawa trace lintas proses (HTTP, gRPC, queue, dll.).
+- **Adapter HTTP** — `transport/http.Middleware` (server) dan `transport/http.InjectHeaders` (client).
+- **Adapter gRPC** — `transport/grpc.UnaryServerInterceptor` dan `transport/grpc.UnaryClientInterceptor`.
 
 ### Perubahan API / perilaku
 
 - `Init`: jika `ServiceName` kosong dan `ServiceNames` tidak kosong, default tracer memakai `ServiceNames[0]`.
 - `GetTracingForService`: jika `ServiceNames` diisi, hanya nama dalam daftar yang diizinkan (whitelist); selain itu fallback ke tracer default.
 - `Shutdown`: shutdown tracer global **dan** semua tracer dari `GetTracingForService`.
+- `noopSpan`: mengimplementasikan `Context()` dan menyimpan context dari `Operation()` agar tetap kompatibel dengan `domain.Span`.
 
 ### Testing
 
@@ -245,7 +340,8 @@ Ringkasan perubahan sebelum PR:
 
 ### Breaking changes
 
-Tidak ada breaking change pada signature API publik yang sudah ada (`Init`, `GetTracing`, `Operation`, `span.Info/Error/Warning/Debug`, `Finish`, `Shutdown`). Field config baru (`ServiceNames`, `SampleRatio`) opsional; perilaku lama tetap jalan jika tidak diisi.
+- **`domain.Span` menambah method `Context() context.Context`** — implementasi custom `Span` (selain yang disediakan modul) wajib menambahkan method ini.
+- Field config baru (`ServiceNames`, `SampleRatio`) opsional; perilaku lama tetap jalan jika tidak diisi.
 
 ## License
 

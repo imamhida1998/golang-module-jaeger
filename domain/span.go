@@ -17,6 +17,14 @@ type Span interface {
 	Warning(scope, message string)
 	// Debug mencatat log level Debug.
 	Debug(scope, message string)
+	// Context mengembalikan context.Context yang membawa span ini sebagai span aktif.
+	// PENTING: teruskan ctx ini (bukan ctx yang dipakai untuk membuat span) ke layer/fungsi
+	// berikutnya supaya Operation() selanjutnya menjadi CHILD span, bukan root span baru.
+	//
+	//	span := tracing.GetTracing().Operation(ctx, ...)
+	//	defer span.Finish()
+	//	NextLayer(span.Context()) // <- bukan ctx yang lama
+	Context() context.Context
 	// Finish mengakhiri span dan mengirim ke Jaeger. Selalu panggil dengan defer.
 	Finish()
 }
